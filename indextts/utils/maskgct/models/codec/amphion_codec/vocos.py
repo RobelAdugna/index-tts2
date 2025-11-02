@@ -559,7 +559,7 @@ class AdaLayerNorm(nn.Module):
 
 class ResBlock1(nn.Module):
     """
-    ResBlock adapted from HiFi-GAN V1 (https://github.com/jik876/hifi-gan) with dilated 1D convolutions,
+    ResBlock adapted from -GAN V1 (https://github.com/jik876/-gan) with dilated 1D convolutions,
     but without upsampling layers.
 
     Args:

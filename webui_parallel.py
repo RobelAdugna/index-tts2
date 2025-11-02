@@ -5,8 +5,10 @@ import atexit
 import itertools
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
+import random
 import shutil
 import sys
 import threading
@@ -16,6 +18,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import warnings
+
+import numpy as np
+import torch
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -253,6 +258,55 @@ class GenerationJob:
     verbose: bool
 
 
+def _normalize_seed(seed_value: Any) -> Optional[int]:
+    if seed_value is None:
+        return None
+    if isinstance(seed_value, str):
+        value = seed_value.strip()
+        if not value:
+            return None
+        try:
+            seed = int(value)
+        except ValueError:
+            try:
+                seed = int(float(value))
+            except ValueError:
+                return None
+    elif isinstance(seed_value, bool):
+        seed = int(seed_value)
+    elif isinstance(seed_value, float):
+        if math.isnan(seed_value):
+            return None
+        seed = int(seed_value)
+    else:
+        try:
+            seed = int(seed_value)
+        except (TypeError, ValueError):
+            return None
+    if seed < 0:
+        seed = abs(seed)
+    return seed
+
+
+def _apply_seed(seed: Optional[int]) -> None:
+    if seed is None:
+        return
+    py_seed = int(seed % (2**32))
+    random.seed(py_seed)
+    np.random.seed(py_seed)
+    torch_seed = int(seed % (2**63 - 1))
+    torch.manual_seed(torch_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(torch_seed)
+
+
+def _prepare_generation_kwargs(raw_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    kwargs = dict(raw_kwargs or {})
+    seed = _normalize_seed(kwargs.pop("seed", None))
+    _apply_seed(seed)
+    return kwargs
+
+
 def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, Any]):
     hf_cache = config.get("hf_cache")
     torch_cache = config.get("torch_cache")
@@ -288,6 +342,7 @@ def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, 
             emo_alpha = job["emo_weight"] if emo_mode == 1 else 1.0
             emo_vector = job["emo_vector"] if emo_mode == 2 else None
             use_emo_text = emo_mode == 3
+            generation_kwargs = _prepare_generation_kwargs(job.get("generation_kwargs", {}))
 
             worker_tts.infer(
                 spk_audio_prompt=job["prompt_path"],
@@ -301,7 +356,7 @@ def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, 
                 use_random=job["emo_random"],
                 verbose=job.get("verbose", False),
                 max_text_tokens_per_sentence=job["max_tokens"],
-                **job["generation_kwargs"],
+                **generation_kwargs,
             )
             result_queue.put(
                 {
@@ -414,6 +469,14 @@ def create_demo() -> gr.Blocks:
                         step=10,
                         info="Maximum generated mel tokens",
                     )
+                    seed_value = gr.Number(
+                        label="Seed",
+                        value=None,
+                        precision=0,
+                        minimum=0,
+                        step=1,
+                        info="Leave blank for random sampling; set a value for reproducible outputs.",
+                    )
                 with gr.Column(scale=2):
                     gr.Markdown("**Sentence Settings**")
                     max_text_tokens_per_sentence = gr.Slider(
@@ -439,6 +502,7 @@ def create_demo() -> gr.Blocks:
             num_beams,
             repetition_penalty,
             max_mel_tokens,
+            seed_value,
         ]
 
         with gr.Tab("Single Generation"):
@@ -550,25 +614,12 @@ def create_demo() -> gr.Blocks:
             output_path = os.path.join(current_dir, "outputs", f"spk_{int(time.time())}.wav")
             ensure_primary_tts().gr_progress = progress
 
-            (do_sample_value,
-            top_p_value,
-            top_k_value,
-            temperature_value,
-            length_penalty_value,
-            num_beams_value,
-            repetition_penalty_value,
-            max_mel_tokens_value) = args
-
-            kwargs = {
-                "do_sample": bool(do_sample_value),
-                "top_p": float(top_p_value),
-                "top_k": int(top_k_value) if int(top_k_value) > 0 else None,
-                "temperature": float(temperature_value),
-                "length_penalty": float(length_penalty_value),
-                "num_beams": int(num_beams_value),
-                "repetition_penalty": float(repetition_penalty_value),
-                "max_mel_tokens": int(max_mel_tokens_value),
-            }
+            advanced_values = list(args)
+            expected_len = len(advanced_params)
+            if len(advanced_values) < expected_len:
+                advanced_values.extend([None] * (expected_len - len(advanced_values)))
+            raw_generation_kwargs = build_generation_kwargs(*advanced_values[:expected_len])
+            generation_kwargs = _prepare_generation_kwargs(raw_generation_kwargs)
 
             emo_mode = emo_control_method_value if isinstance(emo_control_method_value, int) else getattr(emo_control_method_value, "value", 0)
             if emo_mode == 2:
@@ -592,7 +643,7 @@ def create_demo() -> gr.Blocks:
                 use_random=emo_random_value,
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_sentence=int(max_text_tokens_per_sentence_value),
-                **kwargs,
+                **generation_kwargs,
             )
 
             return gr.update(value=output_path, visible=True)
@@ -760,7 +811,17 @@ def create_demo() -> gr.Blocks:
                 vec = vec_values
             return mode, vec
 
-        def build_generation_kwargs(do_sample_value, top_p_value, top_k_value, temperature_value, length_penalty_value, num_beams_value, repetition_penalty_value, max_mel_tokens_value):
+        def build_generation_kwargs(
+            do_sample_value,
+            top_p_value,
+            top_k_value,
+            temperature_value,
+            length_penalty_value,
+            num_beams_value,
+            repetition_penalty_value,
+            max_mel_tokens_value,
+            seed_value,
+        ):
             try:
                 top_k_int = int(top_k_value)
             except (TypeError, ValueError):
@@ -769,7 +830,7 @@ def create_demo() -> gr.Blocks:
                 num_beams_int = int(num_beams_value)
             except (TypeError, ValueError):
                 num_beams_int = 1
-            return {
+            kwargs = {
                 "do_sample": bool(do_sample_value),
                 "top_p": float(top_p_value),
                 "top_k": top_k_int if top_k_int > 0 else None,
@@ -779,6 +840,10 @@ def create_demo() -> gr.Blocks:
                 "repetition_penalty": float(repetition_penalty_value),
                 "max_mel_tokens": int(max_mel_tokens_value),
             }
+            seed_int = _normalize_seed(seed_value)
+            if seed_int is not None:
+                kwargs["seed"] = seed_int
+            return kwargs
 
         def load_dataset_entries(dataset_path, rows, next_id, selected_value, *, progress: Optional[gr.Progress] = None):
             rows = rows or []
@@ -914,7 +979,11 @@ def create_demo() -> gr.Blocks:
             except (TypeError, ValueError):
                 max_tokens = 120
 
-            generation_kwargs = build_generation_kwargs(*advanced_param_values)
+            adv_values = list(advanced_param_values)
+            expected_len = len(advanced_params)
+            if len(adv_values) < expected_len:
+                adv_values.extend([None] * (expected_len - len(adv_values)))
+            base_generation_kwargs = build_generation_kwargs(*adv_values[:expected_len])
 
             outputs_dir = os.path.join(current_dir, "outputs", "tasks")
             os.makedirs(outputs_dir, exist_ok=True)
@@ -951,7 +1020,7 @@ def create_demo() -> gr.Blocks:
                         emo_random=bool(emo_random_value),
                         emo_ref_path=emo_ref_path if emo_mode == 1 else None,
                         max_tokens=max_tokens,
-                        generation_kwargs=generation_kwargs,
+                        generation_kwargs=dict(base_generation_kwargs),
                         verbose=cmd_args.verbose,
                     )
                 )
@@ -1022,7 +1091,11 @@ def create_demo() -> gr.Blocks:
             except (TypeError, ValueError):
                 max_tokens = 120
 
-            generation_kwargs = build_generation_kwargs(*advanced_param_values)
+            adv_values = list(advanced_param_values)
+            expected_len = len(advanced_params)
+            if len(adv_values) < expected_len:
+                adv_values.extend([None] * (expected_len - len(adv_values)))
+            generation_kwargs = build_generation_kwargs(*adv_values[:expected_len])
             outputs_dir = os.path.join(current_dir, "outputs", "tasks")
             os.makedirs(outputs_dir, exist_ok=True)
             output_path = os.path.join(outputs_dir, f"batch_row_{selected_row['id']}_{int(time.time() * 1000)}.wav")
@@ -1039,7 +1112,7 @@ def create_demo() -> gr.Blocks:
                 emo_random=bool(emo_random_value),
                 emo_ref_path=emo_ref_path if emo_mode == 1 else None,
                 max_tokens=max_tokens,
-                generation_kwargs=generation_kwargs,
+                generation_kwargs=dict(generation_kwargs),
                 verbose=cmd_args.verbose,
             )
 

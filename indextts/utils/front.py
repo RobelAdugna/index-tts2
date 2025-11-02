@@ -2,6 +2,7 @@
 import os
 import traceback
 import re
+import unicodedata
 from typing import List, Union, overload
 import warnings
 from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
@@ -9,9 +10,14 @@ from sentencepiece import SentencePieceProcessor
 
 
 class TextNormalizer:
-    def __init__(self):
+    _HIRAGANA_PATTERN = re.compile(r"[\u3040-\u309f]")
+    _KATAKANA_PATTERN = re.compile(r"[\u30a0-\u30ff\u31f0-\u31ff\uFF66-\uFF9F]")
+    _JAPANESE_PUNCT = re.compile(r"[ー〜〝〞〟・]")
+
+    def __init__(self, preferred_language: str | None = None):
         self.zh_normalizer = None
         self.en_normalizer = None
+        self.preferred_language = preferred_language
         self.char_rep_map = {
             "：": ",",
             "；": ",",
@@ -51,6 +57,9 @@ class TextNormalizer:
         }
         self.zh_char_rep_map = {
             "$": ".",
+            **self.char_rep_map,
+        }
+        self.jp_char_rep_map = {
             **self.char_rep_map,
         }
 
@@ -110,11 +119,37 @@ class TextNormalizer:
             )
             self.en_normalizer = NormalizerEn(overwrite_cache=False)
 
-    def normalize(self, text: str) -> str:
+    def is_japanese(self, text: str) -> bool:
+        if self._HIRAGANA_PATTERN.search(text) or self._KATAKANA_PATTERN.search(text):
+            return True
+        if self._JAPANESE_PUNCT.search(text):
+            return True
+        # iteration marks and katakana-hiragana prolonged sound mark
+        if any(ch in text for ch in ("々", "〆", "ゝ", "ゞ", "ゝ", "ゞ", "ー")):
+            return True
+        return False
+
+    def normalize_japanese(self, text: str) -> str:
+        text = text.strip()
+        if not text:
+            return ""
+        text = re.sub(r"^\s*(?:speaker|spk)\s*\d+\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+        text = unicodedata.normalize("NFKC", text)
+        text = re.sub(r"\s+", " ", text)
+        pattern = re.compile("|".join(re.escape(p) for p in self.jp_char_rep_map.keys()))
+        text = pattern.sub(lambda x: self.jp_char_rep_map[x.group()], text)
+        return text.strip()
+
+    def normalize(self, text: str, language: str | None = None) -> str:
         if not self.zh_normalizer or not self.en_normalizer:
             print("Error, text normalizer is not initialized !!!")
             return ""
-        if self.use_chinese(text):
+        lang = language or self.preferred_language
+        if lang is None and self.is_japanese(text):
+            lang = "ja"
+        if lang == "ja":
+            return self.normalize_japanese(text)
+        if lang == "zh" or (lang is None and self.use_chinese(text)):
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             replaced_text, pinyin_list = self.save_pinyin_tones(text.rstrip())
             
@@ -310,26 +345,26 @@ class TextTokenizer:
             tokens = [tokens]
         return [self.sp_model.PieceToId(token) for token in tokens]
 
-    def tokenize(self, text: str) -> List[str]:
-        return self.encode(text, out_type=str)
+    def tokenize(self, text: str, language: str | None = None) -> List[str]:
+        return self.encode(text, out_type=str, language=language)
 
-    def encode(self, text: str, **kwargs):
+    def encode(self, text: str, language: str | None = None, **kwargs):
         if len(text) == 0:
             return []
         if len(text.strip()) == 1:
             return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
         # 预处理
         if self.normalizer:
-            text = self.normalizer.normalize(text)
+            text = self.normalizer.normalize(text, language=language)
         if len(self.pre_tokenizers) > 0:
             for pre_tokenizer in self.pre_tokenizers:
                 text = pre_tokenizer(text)
         return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
 
-    def batch_encode(self, texts: List[str], **kwargs):
+    def batch_encode(self, texts: List[str], language: str | None = None, **kwargs):
         # 预处理
         if self.normalizer:
-            texts = [self.normalizer.normalize(text) for text in texts]
+            texts = [self.normalizer.normalize(text, language=language) for text in texts]
         if len(self.pre_tokenizers) > 0:
             for pre_tokenizer in self.pre_tokenizers:
                 texts = [pre_tokenizer(text) for text in texts]
@@ -343,7 +378,10 @@ class TextTokenizer:
 
     @staticmethod
     def split_segments_by_token(
-        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int
+        tokenized_str: List[str],
+        split_tokens: List[str],
+        max_text_tokens_per_segment: int,
+        quick_streaming_tokens: int = 0
     ) -> List[List[str]]:
         """
         将tokenize后的结果按特定token进一步分割
@@ -358,7 +396,17 @@ class TextTokenizer:
             token = tokenized_str[i]
             current_segment.append(token)
             current_segment_tokens_len += 1
-            if current_segment_tokens_len <= max_text_tokens_per_segment:
+            if not  ("," in split_tokens or "▁," in split_tokens ) and ("," in current_segment or "▁," in current_segment): 
+                # 如果当前tokens中有,，则按,分割
+                sub_segments = TextTokenizer.split_segments_by_token(
+                    current_segment, [",", "▁,"], max_text_tokens_per_segment=max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens
+                )
+            elif "-" not in split_tokens and "-" in current_segment:
+                # 没有,，则按-分割
+                sub_segments = TextTokenizer.split_segments_by_token(
+                    current_segment, ["-"], max_text_tokens_per_segment=max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens
+                )
+            elif current_segment_tokens_len <= max_text_tokens_per_segment:
                 if token in split_tokens and current_segment_tokens_len > 2:
                     if i < len(tokenized_str) - 1:
                         if tokenized_str[i + 1] in ["'", "▁'"]:
@@ -370,16 +418,6 @@ class TextTokenizer:
                     current_segment_tokens_len = 0
                 continue
             # 如果当前tokens的长度超过最大限制
-            if not  ("," in split_tokens or "▁," in split_tokens ) and ("," in current_segment or "▁," in current_segment): 
-                # 如果当前tokens中有,，则按,分割
-                sub_segments = TextTokenizer.split_segments_by_token(
-                    current_segment, [",", "▁,"], max_text_tokens_per_segment=max_text_tokens_per_segment
-                )
-            elif "-" not in split_tokens and "-" in current_segment:
-                # 没有,，则按-分割
-                sub_segments = TextTokenizer.split_segments_by_token(
-                    current_segment, ["-"], max_text_tokens_per_segment=max_text_tokens_per_segment
-                )
             else:
                 # 按照长度分割
                 sub_segments = []
@@ -400,14 +438,19 @@ class TextTokenizer:
         if current_segment_tokens_len > 0:
             assert current_segment_tokens_len <= max_text_tokens_per_segment
             segments.append(current_segment)
-        # 如果相邻的句子加起来长度小于最大限制，则合并
+        # 如果相邻的句子加起来长度小于最大限制，且此前token总数超过quick_streaming_tokens，则合并
         merged_segments = []
+        total_token = 0
         for segment in segments:
+            total_token += len(segment)
             if len(segment) == 0:
                 continue
             if len(merged_segments) == 0:
                 merged_segments.append(segment)
-            elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment:
+            elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment and total_token > quick_streaming_tokens:
+                merged_segments[-1] = merged_segments[-1] + segment
+            # 或小于最大长度限制的一半，则合并
+            elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment / 2:
                 merged_segments[-1] = merged_segments[-1] + segment
             else:
                 merged_segments.append(segment)
@@ -422,9 +465,9 @@ class TextTokenizer:
         "▁?",
         "▁...", # ellipsis
     ]
-    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120) -> List[List[str]]:
+    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120, quick_streaming_tokens = 0) -> List[List[str]]:
         return TextTokenizer.split_segments_by_token(
-            tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment
+            tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens
         )
 
 
